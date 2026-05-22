@@ -1,50 +1,6 @@
 # ============================================================
 # Mac BLE Control Dashboard for ENGG1100 Prototype
 # ============================================================
-# ============================================================
-# 【繁體粵語總說明】
-# 呢份程式係 Mac 端控制介面，用嚟透過 BLE 控制 Arduino 原型。
-# 主要流程係：
-# 1. Mac 用 Bleak 連接 HMSoft BLE 模組。
-# 2. Tkinter 負責顯示控制面板，例如按鈕、Log、3D 姿態圖。
-# 3. Arduino 經 BLE 回傳 X/Y/Z 姿態資料，Mac 端收到後更新 UI。
-# 4. Xbox 手掣可以用嚟控制四個角位電機、前後左右雙電機、全收線等功能。
-#
-# 注意：Tkinter 只可以喺主執行緒更新 UI。
-# BLE callback 喺背景 thread 執行，所以唔可以直接改 UI，
-# 必須先放入 queue，再由 process_thread_queues() 喺主 thread 處理。
-# ============================================================
-# ============================================================
-# 【調整原因總結】
-# 呢份程式係一路測試一路改出嚟，唔係一次過完成。
-# 每次改動都係為咗解決實際 demo 測試時遇到嘅問題。
-#
-# 主要問題同解決方向：
-# 1. BLE 可以連接，但一收到資料就 crash：
-#    原因係 BLE callback 喺背景 thread 直接碰 Tkinter。
-#    解法係用 queue，等 Tkinter 主 thread 自己處理 UI 更新。
-#
-# 2. 連續撳按鈕或者 Xbox 連續發指令時，UI 會卡或者 unexpected exit：
-#    原因係 BLE send 太密，上一條未完成又送下一條。
-#    解法係加 send_busy 同 ui_log_queue，減少 thread 衝突。
-#
-# 3. Xbox 左搖桿原本想同時控制前後左右同四個角，但操作唔直觀：
-#    解法係重新分工，左搖桿只控制四個角，D-pad 控制前後左右雙電機。
-#
-# 4. D-pad 一開始完全冇反應：
-#    原因係 macOS / pygame 入面，手掣十字鍵唔一定係 hat，可能係 button。
-#    實測後用 button 10 / 7 / 8 / 9 做前後左右 mapping，並按實物反應做方向修正。
-#
-# 5. button 13 一開始理解成方向反轉，但實際需要係動作反轉：
-#    最後改成方向不變，正常 IN，按住 13 變 OUT。
-#
-# 6. button 0 快速全收線會暫時改 TIME_500：
-#    如果唔還原，之後普通控制每次都會郁太多。
-#    所以獨立成 fast_all_in_action()，完成後還原 TIME_150。
-#
-# 7. 電機扭矩同動作量要分開處理：
-#    用 HIGH 保持足夠起動扭矩；用 TIME_150、controller_send_interval 同 repeats 控制每次郁幾多。
-# ============================================================
 # 呢个 Python 程序係 Mac 端控制面板。
 #
 # 主要功能：
@@ -105,15 +61,6 @@ except Exception:
 # ============================================================
 # 深色 + 青绿色高亮，令 UI 更似科技控制面板。
 # ============================================================
-# 【調整原因】
-# UI 一開始比較似普通 Tkinter 工具，視覺上唔夠 demo 感。
-# 後來改成深色背景、青色高亮、綠色狀態提示，係為咗令控制面板更似工程控制台。
-# 顏色亦有功能分工：
-# - GREEN：正常 / connected / 啟用。
-# - RED：危險 / 停止 / 未連接。
-# - ORANGE：警告 / 非水平狀態。
-# - CYAN / BLUE：科技感控制按鈕同狀態提示。
-# ============================================================
 BG_MAIN = "#070A12"
 BG_PANEL = "#0E1422"
 BG_PANEL_ALT = "#101827"
@@ -130,11 +77,6 @@ TEXT_MUTED = "#8EA4B8"
 
 # ============================================================
 # BLE device information
-# ============================================================
-# 【調整原因】
-# BLE 地址同 characteristic UUID 係根據實際掃描 HMSoft 模組得到。
-# 之前連接問題好多時唔係程式邏輯錯，而係地址、UUID 或者模組被其他 App 佔用。
-# 所以將 DEVICE_ADDRESS 同 CHAR_UUID 集中放喺呢一區，方便之後換 BLE 模組時快速修改。
 # ============================================================
 
 DEVICE_ADDRESS = "FB39458D-5F01-B0CE-AFA4-BC6A781B3407"
@@ -170,11 +112,6 @@ loop = asyncio.new_event_loop()
 # ============================================================
 # Current sensor values
 # ============================================================
-# 【調整原因】
-# current_x / current_y / current_z 係 Mac 端保存嘅最新姿態值。
-# 之前只係將 Arduino 回傳文字直接顯示，唔方便後續畫 3D 平台。
-# 所以加全局變數保存最後一次解析成功嘅 X/Y/Z，方便 draw_3d_platform() 使用。
-# ============================================================
 
 current_x = 0
 current_y = 0
@@ -186,13 +123,6 @@ current_z = 0
 
 # ============================================================
 # Xbox controller variables
-# 【繁體粵語說明】
-# 呢一區係 Xbox 手掣控制嘅主要設定。
-# - 左搖桿：用嚟控制四個角位單獨電機，例如 LF / RF / RR / RL。
-# - D-pad / 十字鍵：用嚟控制前後左右兩個電機一齊郁，例如 FRONT / BACK / LEFT / RIGHT。
-# - button 13：唔係反轉方向，而係反轉動作；正常係 IN，按住 13 變成 OUT。
-# - button 0 / A：快速全收線，會暫時用較長 pulse，之後會自動還原 TIME_150。
-# ============================================================
 # ============================================================
 # 呢度係 Xbox controller 状态。
 # controller_enabled = True 先会开始读手柄。
@@ -209,8 +139,8 @@ last_controller_button_time = 0
 last_dpad_send_time = 0
 xbox_reverse_mode = False
 
-controller_deadzone = 0.03
-controller_send_interval = 0.40
+controller_deadzone = 0.005
+controller_send_interval = 0.12
 controller_button_interval = 0.50
 
 #
@@ -230,18 +160,15 @@ controller_mode = "TILT_IN"
 # 左摇杆方向代表希望船向哪个方向倾斜。
 # 系统只发送对应方向的 IN 指令，不再自动发送对边 OUT。
 # scheduler 每次只发送一个 Arduino 指令，但会按权重轮流发，实现比例感。
-controller_weight_threshold = 0.03
-controller_vector_gain = 1.25
+controller_weight_threshold = 0.01
+controller_vector_gain = 2.20
 controller_weight_bucket = []
 controller_bucket_index = 0
 controller_last_vector_key = None
 
-xbox_motor_boost_done = False
-
 # Xbox motor startup boost.
-# 为了有足够扭矩，Xbox 模式仍然自动切到 HIGH。
-# 但实际移动速度通过较慢的 controller_send_interval 和较少 repeats 控制，避免动作太快。
-# Connect Xbox 后自动切到 HIGH + TIME_150。
+# 你 Arduino 现在 speedValue/runTime 偏低，摇杆短 pulse 可能只会令电机嘟嘟响但转唔起。
+# Connect Xbox 后自动切到 HIGH + TIME_250，俾电机足够启动扭矩同时间。
 xbox_motor_boost_done = False
 
 
@@ -251,14 +178,6 @@ xbox_motor_boost_done = False
 # 原因：旧版 send_action 会喺 Tkinter 主线程入面等 BLE 发送完成。
 # 如果连续按按钮 / Xbox 连续发指令，GUI 可能会 unexpected exit。
 # send_busy 用嚟保证同一时间只发一条 BLE 指令。
-# ============================================================
-# 【調整原因】
-# 舊版每次撳按鈕都會即刻送 BLE 指令，Xbox 又會高頻率重複送指令。
-# 實測時如果上一條 BLE write 未完成，下一條又入嚟，Mac 端就有機會卡死或者閃退。
-# send_busy 嘅作用係做一個簡單保護：同一時間盡量只送一條指令。
-#
-# ble_text_queue 用嚟接收 Arduino 回傳文字，ui_log_queue 用嚟接收背景 thread 嘅 log。
-# 兩個 queue 都係為咗避免背景 thread 直接改 Tkinter UI。
 # ============================================================
 send_busy = False
 last_send_error_time = 0
@@ -273,17 +192,6 @@ MAX_LOG_LINES = 300
 # BLE
 # =========================
 
-#
-# 【繁體粵語說明】
-# 呢個函數係 BLE notify callback。
-# Arduino 一有資料經 BLE 傳返嚟，例如 X/Y/Z 或 Status，
-# Bleak 就會自動呼叫呢個函數。
-#
-# 非常重要：呢度唔可以直接 call root.after() 或改任何 Tkinter widget。
-# 因為呢個函數唔一定喺 Tkinter 主 thread 入面行。
-# 如果喺呢度直接碰 Tkinter，Python 3.14 + macOS CoreBluetooth 會有機會 fatal crash。
-# 所以正確做法係：只將文字放入 ble_text_queue。
-# ============================================================
 def ble_notification_handler(sender, data):
     """
     BLE notify callback.
@@ -296,11 +204,6 @@ def ble_notification_handler(sender, data):
     if text:
         ble_text_queue.put(text)
 
- # 【調整原因】
-# ble_connect() 會喺連接成功後立即 start_notify()。
-# 因為 Arduino 會定時 BT.println() 回傳資料，如果唔開 notify，Mac 只可以寫入指令但收唔到狀態。
-# 早期「Connected 但冇資料」嘅問題，通常就係 notify / queue / STATUS 其中一段未正常工作。
-# ============================================================
 async def ble_connect():
     """
     连接 BLE 模块。
@@ -333,11 +236,6 @@ async def ble_connect():
     return client.is_connected
 
 
- # 【調整原因】
-# Arduino 端係用 readStringUntil('\n') 讀指令，所以 Mac 每條指令都要加換行符號。
-# 如果冇加 '\n'，Arduino 可能會一直等，表現就係按鈕撳咗但電機冇反應。
-# 呢個 function 統一處理所有 BLE write，避免每個按鈕重複寫同一段發送邏輯。
-# ============================================================
 async def ble_send(command):
     """
     经 BLE 发送一条指令俾 Arduino。
@@ -369,12 +267,6 @@ async def ble_send(command):
     # 将 command 加换行，再 encode 成 bytes，写入 BLE characteristic。
 
 
- # 【調整原因】
-# 關閉視窗前先送 AUTO_OFF 同 ALLS，係為咗安全。
-# 因為如果直接斷 BLE，而 Arduino 仍然停留喺自穩或者某個運動狀態，
-# 可能會令電機繼續郁或者保持不受控狀態。
-# 所以 disconnect 前先關自穩、再停止所有電機。
-# ============================================================
 async def ble_disconnect():
     """
     断开 BLE 连接。
@@ -401,11 +293,6 @@ async def ble_disconnect():
         await client.disconnect()
 
 
- # 【調整原因】
-# Tkinter 主視窗要佔住主 thread，BLE 又需要 asyncio event loop。
-# 如果兩個都放喺同一個 thread，UI 會卡住或者 BLE await 會阻塞介面。
-# 所以將 asyncio loop 放到背景 thread，Tkinter 保留喺主 thread。
-# ============================================================
 def run_loop():
     """
     后台 asyncio loop。
@@ -428,13 +315,6 @@ threading.Thread(target=run_loop, daemon=True).start()
 # GUI helpers
 # =========================
 
-#
-# 【調整原因】
-# Connect BLE 成功後會立即發送 STATUS。
-# 因為早期版本有時只顯示 Connected，但 UI 冇任何姿態資料，
-# 使用者會分唔清係 Arduino 冇回傳，定係 Mac 端冇收到。
-# 主動要求一次 STATUS，可以即刻驗證 BLE receive、queue、UI 更新三部分係咪正常。
-# ============================================================
 def connect_action():
     """
     Connect BLE 按钮执行嘅函数。
@@ -464,15 +344,6 @@ def connect_action():
         messagebox.showerror("BLE connection error", str(e))
 
 
-#
-# 【繁體粵語說明】
-# send_action() 係所有 UI 按鈕同 Xbox 控制最後都會用到嘅發送入口。
-# 佢負責將例如 LF_IN、FRONT_OUT、AUTO_ON 呢啲文字指令送去 Arduino。
-#
-# 為咗避免 UI 卡死，呢個函數唔會直接等待 BLE 傳送完成。
-# 佢會將 ble_send(command) 丟去背景 asyncio loop。
-# 傳送完成之後，on_done() 只會寫入 ui_log_queue，唔會直接改 UI。
-# ============================================================
 def send_action(command):
     """
     Non-blocking BLE send.
@@ -481,11 +352,6 @@ def send_action(command):
     The on_done callback runs in the BLE / asyncio background thread.
     It must not call root.after(), add_log(), or touch Tkinter directly.
     """
-    # 【調整原因】
-    # 之前 send_action 如果直接等 BLE 傳送完成，Tkinter UI 會卡住。
-    # 另一個問題係 BLE 完成 callback 可能喺背景 thread 執行，
-    # 如果喺嗰度直接 root.after() 或 add_log()，Python 3.14 會有 GIL fatal crash。
-    # 所以而家改成：主 thread 只排程，BLE send 交俾 asyncio loop，完成後只寫 ui_log_queue。
     global send_busy
 
     if send_busy:
@@ -518,43 +384,6 @@ def send_action(command):
     future.add_done_callback(on_done)
 
 # ============================================================
-# Fast all-line retract helper
-# ============================================================
-
-#
-# 【繁體粵語說明】
-# fast_all_in_action() 係獨立嘅快速全收線功能。
-# 用 button 0 / A 觸發。
-#
-# 做法：
-# 1. 先切 HIGH，確保電機有足夠扭矩。
-# 2. 暫時切 TIME_500，令 ALL_IN 有足夠時間收線。
-# 3. 發送 ALL_IN，四個電機一齊收。
-# 4. 完成後自動還原 TIME_150，避免影響普通 Xbox 控制。
-# ============================================================
-def fast_all_in_action():
-    """
-    Fast all-line retract as a separate action.
-
-    It temporarily uses HIGH + TIME_500 for strong/fast full retract,
-    then restores TIME_150 so normal Xbox joystick / D-pad control is not affected.
-    """
-    # 【調整原因】
-    # button 0 / A 係快速全收線功能。
-    # 一開始將 HIGH、TIME_500、ALL_IN 直接寫喺 Xbox loop 入面，
-    # 但會留下 TIME_500，導致之後左搖桿同 D-pad 每次都郁太多。
-    # 所以獨立成一個 function：用完 TIME_500 之後自動還原 TIME_150。
-    add_log("Fast ALL IN sequence start")
-
-    send_action("HIGH")
-    root.after(300, lambda: send_action("TIME_500"))
-    root.after(650, lambda: send_action("ALL_IN"))
-
-    # Restore normal Xbox pulse duration after the fast retract sequence.
-    root.after(1400, lambda: send_action("TIME_150"))
-    root.after(1700, lambda: add_log("Fast ALL IN sequence finished; TIME_150 restored"))
-
-# ============================================================
 # Xbox controller functions
 # ============================================================
 
@@ -567,11 +396,6 @@ def init_xbox_controller():
     2. Python UI 入面按 Connect Xbox
     3. 如果 pygame 读到手柄，就会显示 Xbox: Connected
     """
-    # 【調整原因】
-    # Xbox 連接後自動送 HIGH + TIME_150。
-    # 實測時如果 pulse 太短，例如 TIME_100，前面兩個電機會冇力，只係嘟嘟響。
-    # 如果 pulse 太長，例如 TIME_200 或 TIME_500，船又會一次郁太多，唔方便微調。
-    # 最後用 HIGH 保持扭矩，再用 TIME_150 控制每次動作量。
     global controller_enabled, joystick, xbox_motor_boost_done
 
     if not PYGAME_AVAILABLE:
@@ -605,9 +429,9 @@ def init_xbox_controller():
         # 只做一次 boost，避免摇杆短 pulse 只令电机嘟嘟响。
         if not xbox_motor_boost_done:
             xbox_motor_boost_done = True
-            add_log("Xbox motor boost: HIGH torque + shorter 0.15s pulses")
+            add_log("Xbox motor boost: HIGH + TIME_250")
             root.after(100, lambda: send_action("HIGH"))
-            root.after(450, lambda: send_action("TIME_150"))
+            root.after(450, lambda: send_action("TIME_250"))
 
     except Exception as e:
         controller_enabled = False
@@ -616,22 +440,6 @@ def init_xbox_controller():
 
 
 
-#
-# 【繁體粵語說明】
-# joystick_to_weighted_commands() 負責將左搖桿 X/Y 轉成 Arduino 指令。
-# 而家左搖桿只負責四個角位電機：
-# - 左前 LF
-# - 右前 RF
-# - 後右 RR
-# - 後左 RL
-#
-# 純前 / 後 / 左 / 右嘅雙電機控制已經交俾 D-pad 處理。
-# 所以呢個函數入面唔再產生 FRONT_IN、BACK_IN、LEFT_IN、RIGHT_IN。
-#
-# reverse_mode 由 button 13 控制：
-# - False：對應角位發 IN
-# - True：對應角位發 OUT
-# ============================================================
 def joystick_to_weighted_commands(x, y, mode, reverse_mode=False):
     """
     Xbox 左摇杆倾斜控制逻辑。
@@ -657,14 +465,6 @@ def joystick_to_weighted_commands(x, y, mode, reverse_mode=False):
         不发送对边 OUT。
         这样控制更像“我要船往哪边压/倾”。
     """
-    # 【調整原因】
-    # 左搖桿最初想做到全方向控制，包括前後左右雙電機同四個角位。
-    # 但實測手感唔好：推正方向時容易誤觸角位，推斜角時又唔夠明確。
-    # 所以最後改成左搖桿只負責四個角位單電機。
-    # 前後左右雙電機控制交俾 D-pad，操作上更清楚。
-    #
-    # button 13 唔反轉方向，只反轉動作：
-    # 同一個角位，正常係 IN，按住 13 就係 OUT。
 
     if abs(x) < controller_deadzone and abs(y) < controller_deadzone:
         return []
@@ -732,36 +532,19 @@ def joystick_to_weighted_commands(x, y, mode, reverse_mode=False):
 
     for command, weight in weights.items():
         if weight >= controller_weight_threshold:
-            # 限制重复触发为 1：每个方向每轮 bucket 只放入一次。
-            # 这样左摇杆不会因为权重高而连续重复触发太多次。
-            command_bucket.append(command)
+            repeats = int(round(weight * 5))
+            repeats = max(1, min(repeats, 6))
+            command_bucket.extend([command] * repeats)
 
     return command_bucket
 
 
-#
-# 【繁體粵語說明】
-# poll_xbox_controller() 係 Xbox 手掣嘅主循環。
-# Tkinter 會每隔一小段時間呼叫一次，讀取手掣狀態。
-#
-# 控制邏輯：
-# - 左搖桿：控制四個角位單電機。
-# - D-pad：控制前後左右雙電機。
-# - button 13：按住時，IN 變 OUT，方向唔變。
-# - button 0 / A：快速全收線。
-# - Y：AUTO_ON。
-# - B：AUTO_OFF。
-# - X：CALIBRATE。
-#
-# D-pad 會優先於左搖桿。
-# 即係按住十字鍵時，左搖桿同一輪唔會再發指令，避免兩套控制互相打架。
-# ============================================================
 def poll_xbox_controller():
     """
     Poll Xbox controller without blocking Tkinter.
 
     Buttons:
-        A / button 0 = FAST ALL IN separate sequence
+        A = STOP ALL
         Y = AUTO ON
         B = AUTO OFF
         X = CALIBRATE
@@ -773,13 +556,6 @@ def poll_xbox_controller():
     Left stick:
         Select motor direction.
     """
-    # 【調整原因】
-    # Xbox 主循環係最多實測修正嘅地方。
-    # 1. D-pad 一開始冇反應，後來用 Buttons=[...] 診斷出真實 button 編號。
-    # 2. 實測結果係前10、後7、左8、右9，但實物方向相反，所以 mapping 入面做咗反轉。
-    # 3. D-pad 優先於左搖桿，避免雙電機控制同角位控制同時發生。
-    # 4. button 13 改成動作反轉，令同一個方向可以用 IN 或 OUT。
-    # 5. button 0 改成獨立快速全收線 sequence，避免影響普通 TIME 設定。
     global last_controller_command
     global last_controller_send_time
     global last_controller_button_time
@@ -876,9 +652,7 @@ def poll_xbox_controller():
 
             if now - last_controller_button_time > controller_button_interval:
                 if a_pressed:
-                    # Button 0 = separate fast all-line retract action.
-                    # The helper restores TIME_150 afterwards so other controls are not affected.
-                    fast_all_in_action()
+                    send_action("ALLS")
                     last_controller_button_time = now
                     last_controller_send_time = now
                     button_command_sent = True
@@ -970,17 +744,6 @@ def poll_xbox_controller():
     root.after(80, poll_xbox_controller)
 
 
-#
-# 【繁體粵語說明】
-# update_received_text() 會處理 Arduino 經 BLE 回傳嘅文字。
-# 例如：
-# X: 10  Y: -20  Z: 5  Status: Level
-#
-# 呢個函數會做三件事：
-# 1. 將原始文字放入 Log。
-# 2. 解析 Status，更新大字姿態顯示。
-# 3. 解析 X/Y/Z，更新 3D 平台示意圖。
-# ============================================================
 def update_received_text(text):
     """
     处理 Arduino 回传内容。
@@ -994,11 +757,6 @@ def update_received_text(text):
     3. 如果有 X/Y/Z，就解析成数字
     4. 用 X/Y 更新 3D 平台图
     """
-    # 【調整原因】
-    # Arduino 會定時回傳 X/Y/Z 同 Status。
-    # 如果資料格式偶爾唔完整，唔應該令 UI crash。
-    # 所以解析 X/Y/Z 時用 try/except，壞資料會直接忽略。
-    # 呢個函數只負責主 thread 入面更新 UI，thread 安全由 queue 系統處理。
 
     global current_x, current_y, current_z
 
@@ -1073,27 +831,12 @@ def add_log(text):
         print("LOG ERROR:", e)
 
 
-#
-# 【繁體粵語說明】
-# process_thread_queues() 係主 thread 入面安全更新 UI 嘅關鍵。
-# BLE callback 同 async callback 只會將資料放入 queue。
-# 呢個函數定時從 queue 取資料，再更新 Tkinter。
-#
-# 咁做可以避免：
-# - BLE 背景 thread 直接改 UI 造成 crash。
-# - Arduino 高频回傳太多資料令 UI 卡死。
-# ============================================================
 def process_thread_queues():
     """
     Tkinter main thread queue processor.
     BLE callbacks and BLE send callbacks put text into queues.
     This function safely updates Tkinter widgets from the main thread.
     """
-    # 【調整原因】
-    # 呢個 function 係為咗修復 BLE + Tkinter 最嚴重嘅 crash。
-    # BLE callback 喺背景 thread，但 Tkinter 只可以喺主 thread 改 UI。
-    # 所以所有背景資料先入 queue，再喺呢度分批取出處理。
-    # 每次限制處理數量，避免 Arduino 回傳太密時 UI 被 queue 拖慢。
     ble_count = 0
     while ble_count < MAX_BLE_MESSAGES_PER_TICK:
         try:
@@ -1118,11 +861,6 @@ def process_thread_queues():
         root.after(50, process_thread_queues)
 
 
- # 【調整原因】
-# 關閉視窗時唔再 future.result() 等 BLE 完成。
-# 之前如果 close 時 BLE 狀態唔穩，阻塞等待可能會造成 unexpected exit 或卡死。
-# 而家只排程 ble_disconnect()，然後關閉 Tkinter 視窗。
-# ============================================================
 def close_action():
     """
     用户关闭窗口时执行。
@@ -1136,12 +874,6 @@ def close_action():
     root.destroy()
 
 
- # 【調整原因】
-# make_card() 用嚟統一 UI 卡片樣式。
-# 因為控制面板有好多區塊：姿態、手動控制、Xbox、自穩、速度、Log。
-# 如果每個區塊都手寫樣式，後期改 UI 會好亂。
-# 所以抽成一個共用 function，令介面風格一致。
-# ============================================================
 def make_card(parent, title):
     """
     创建一个科技感深色卡片区域。
@@ -1163,11 +895,6 @@ def make_card(parent, title):
     return frame
 
 
- # 【調整原因】
-# make_button() 用嚟統一所有按鈕樣式同 hover 效果。
-# 之前按鈕顏色、大小、字體分散寫，UI 會顯得唔統一。
-# 抽成 function 之後，所有控制按鈕都用同一套視覺規則，demo 時更清楚。
-# ============================================================
 def make_button(parent, text, command, bg=GREEN, fg="#000000", width=14):
     """
     创建统一科技感按钮。
@@ -1226,15 +953,6 @@ def select_speed(buttons, selected_button):
 # 3D display
 # =========================
 
-#
-# 【繁體粵語說明】
-# draw_3d_platform() 用 Canvas 畫一個簡化版 3D 平台。
-# 佢唔係真 3D engine，只係用四個角嘅上下位移，
-# 令使用者直觀看到平台而家大概向邊個方向傾斜。
-#
-# x / y 數值來自 Arduino tilt sensor。
-# 數值愈大，畫面入面對應方向嘅傾斜就愈明顯。
-# ============================================================
 def draw_3d_platform(x, y):
     """
     用 Tkinter Canvas 画一个假 3D 平台。
@@ -1252,10 +970,6 @@ def draw_3d_platform(x, y):
         用四个角嘅高度变化模拟平台倾斜。
         呢个唔係真正 3D engine，但足够展示状态。
     """
-    # 【調整原因】
-    # 純文字 Status 例如 Front low / Level 對 demo 觀眾唔夠直觀。
-    # 所以加咗一個簡化 3D 平台圖，用四個角嘅相對位置顯示傾斜方向。
-    # 呢個圖唔係精密量測，只係幫助快速理解平台姿態。
 
     canvas_3d.delete("all")
     # 每次重画前，先清空旧图。
@@ -1456,11 +1170,6 @@ def resize_main_width(event):
 main.bind("<Configure>", update_scroll_region)
 scroll_canvas.bind("<Configure>", resize_main_width)
 
- # 【調整原因】
-# MacBook 觸控板嘅 event.delta 有時好細，用 int(event.delta / 120) 會變 0。
-# 結果就係滾輪 / 觸控板明明有動，但 Tkinter 畫面完全唔滾。
-# 所以改成只判斷 delta 正負方向，令 Mac 觸控板穩定可用。
-# ============================================================
 def on_mousewheel(event):
     """
     鼠标滚轮 / Mac 触控板滚动。
@@ -1700,7 +1409,7 @@ make_button(
 
 xbox_help = tk.Label(
     xbox_card,
-    text="Left stick = corner motor\nD-pad = two-motor pair\nNormal = IN, hold button 13 = OUT\nA/button 0 = fast ALL IN then restore TIME_150\nY = auto on, B = auto off, X = calibrate",
+    text="Left stick = corner motor\nD-pad = two-motor pair\nNormal = IN, hold button 13 = OUT\nA = stop, Y = auto on, B = auto off, X = calibrate",
     bg=BG_PANEL,
     fg=TEXT_MUTED,
     font=("Arial", 10),
@@ -1718,10 +1427,6 @@ speed_card.pack(fill="x", pady=(0, 12))
 
 speed_buttons = []
 
- # 【調整原因】
-# 速度按鈕除咗送 LOW / MID / HIGH 指令，仲要更新 UI 高亮。
-# 如果唔高亮，demo 時操作員唔容易知道而家大概係邊個速度模式。
-# ============================================================
 def set_speed(command, button):
     """
     用户按 LOW/MID/HIGH 时：
@@ -1773,11 +1478,6 @@ manual_times = [
     ("2s", "TIME_2000"),
 ]
 
- # 【調整原因】
-# 動作時間會直接影響每次電機郁幾多。
-# 實測時 TIME 太短會冇力或者只係嘟嘟響，TIME 太長又會一次郁太多。
-# 所以 UI 提供幾個固定選項，避免手動輸入數字造成不一致。
-# ============================================================
 def set_manual_time(command, button):
     """
     设置手动动作时间。
@@ -1815,11 +1515,6 @@ auto_times = [
     ("0.5s", "AUTOTIME_500"),
 ]
 
- # 【調整原因】
-# 自穩 pulse 時間要同手動時間分開，因為自穩需要短而密嘅微調。
-# 如果自穩 pulse 太長，平台會過度修正；太短又可能冇足夠電機動作。
-# 所以獨立成 AUTOTIME 選項。
-# ============================================================
 def set_auto_time(command, button):
     """
     设置自稳每次脉冲时间。
@@ -1871,14 +1566,6 @@ log_box = tk.Text(
 log_box.pack(fill="both", expand=True, padx=6, pady=6)
 
 
- # 【調整原因】
-# 啟動主循環前先 add_log()、process_thread_queues()、poll_xbox_controller()。
-# 原因係：
-# - add_log() 可以確認 UI Log 盒子正常運作。
-# - process_thread_queues() 開始安全處理 BLE 回傳。
-# - poll_xbox_controller() 開始定時讀取手掣。
-# 如果漏咗 queue processor，就會出現 connected 但冇資料更新。
-# ============================================================
 # ============================================================
 # Start Tkinter main loop
 # ============================================================
