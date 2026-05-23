@@ -1,0 +1,96 @@
+供電系統
+呢個原型控制系統使用 12V DC input 作為主要電源。12V 會先進入 Jaycar DC Voltage Regulator XC4514，由 regulator 將電壓降到 9V。之後 9V 會供俾
+L293D Motor Shield / L293D motor driver board，再由 L293D / Motor Shield 供電俾 Arduino UNO。
+Arduino 再負責供電俾低功耗控制模組，包括：
+BLE module
+IMU / tilt sensor
+整體供電架構如下：
+12V DC input
+      ↓
+Jaycar XC4514 DC Voltage Regulator
+      ↓ 9V regulated output
+L293D Motor Shield / Motor Driver
+      ↓
+Arduino UNO
+      ↓
+BLE module + IMU / tilt sensor
+
+L293D Motor Shield / Motor Driver
+      ↓
+M1 / M2 / M3 / M4 DC motors
+
+12V input 唔係直接俾 Arduino
+12V 先經 XC4514 降壓到 9V
+9V 先俾 L293D / Motor Shield
+L293D / Motor Shield 再供電俾 Arduino
+Arduino 再供電俾 BLE module 同 IMU / tilt sensor
+L293D / Motor Shield 同時負責驅動四個 DC motors
+Logic power 同 motor power 嘅分工
+
+呢個系統入面可以分成兩部分：
+Logic side / 控制側
+Power actuation side / 動力側
+
+控制側包括：
+Arduino UNO
+BLE module
+IMU / tilt sensor
+
+動力側包括：
+L293D Motor Shield / Motor Driver
+M1 / M2 / M3 / M4 DC motors
+
+Arduino 主要負責邏輯控制，例如：
+接收 BLE 指令
+讀取 IMU / tilt sensor
+判斷姿態
+發出 motor control signal
+回傳 X/Y/Z + Status
+
+L293D / Motor Shield 主要負責真正推動電機，例如：
+LF_IN
+FRONT_IN
+ALL_IN
+LEFT_OUT
+
+BLE module 同 IMU 點樣供電：
+BLE module 同 IMU / tilt sensor 都屬於低功耗控制模組，所以由 Arduino 供電。
+供電路徑係：
+12V input
+→ XC4514 降壓到 9V
+→ L293D / Motor Shield
+→ Arduino UNO
+→ BLE module + IMU / tilt sensor
+BLE module 主要負責 Mac GUI 同 Arduino 之間嘅無線通訊。Mac 發出例如：
+LF_IN
+FRONT_OUT
+AUTO_ON
+CALIBRATE
+STATUS
+呢啲文字指令會經 BLE module 傳入 Arduino。
+
+IMU / tilt sensor 主要負責提供姿態回饋，例如：
+X value
+Y value
+Z value
+Status: Level / Front low / Left low
+Arduino 讀到 IMU 數值之後，會經 BLE 回傳俾 Mac GUI 顯示。
+
+點解 BLE 同 IMU 由 Arduino 供電
+BLE module 同 IMU / tilt sensor 需要穩定嘅 logic-level power，同 Arduino 使用同一個 ground reference 會比較穩定。
+咁樣做有幾個好處：
+1. BLE signal 同 Arduino serial signal 有共同 ground
+2. IMU I2C signal 同 Arduino I2C bus 有共同 ground
+3. 減少訊號漂移或者讀數異常
+4. 接線更簡單，debug 更容易
+如果 BLE / IMU 唔同 Arduino 共地，可能會出現：
+BLE module 有電但 Arduino 收唔到指令
+IMU X/Y/Z 數值亂跳
+CALIBRATE 後仍然唔穩
+Mac GUI 顯示 connected 但冇穩定回傳
+呢個原型使用 12V DC input，經 Jaycar XC4514 voltage regulator 降壓到 9V。9V 輸出先供俾 L293D motor driver，再由 L293D / Mo
+tor Shield 供電俾 Arduino UNO。Arduino 之後再供電俾 BLE module 同 IMU / tilt sensor，而 L293D 則負責提供四個 DC motors 嘅驅動電源。
+
+The prototype uses a 12V DC input regulated to 9V through a Jaycar XC4514 voltage regulator. The regulated 9V output powers
+the L293D motor driver, which supplies the Arduino UNO. The Arduino then powers the BLE module and IMU/tilt sensor, while the 
+L293D driver provides motor power to the four DC motors.
