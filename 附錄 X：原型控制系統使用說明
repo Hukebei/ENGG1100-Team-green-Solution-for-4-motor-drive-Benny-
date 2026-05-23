@@ -1,0 +1,442 @@
+Appendix X: Prototype Control System Architecture and Operation Guide
+
+X.1 系統總覽
+
+呢個原型控制系統由兩個主要程式組成：
+
+Arduino 程式
+負責硬件控制，包括電機、tilt sensor、BLE 指令接收、自穩邏輯。
+Mac Python 程式
+負責上位機控制，包括 BLE 連接、GUI 控制面板、Xbox 手掣輸入、姿態顯示同 Log 回傳。
+整個系統嘅工作流程係：
+
+Mac GUI / Xbox 手掣
+↓ BLE 指令
+HMSoft BLE 模組
+↓ SoftwareSerial
+Arduino UNO + L293D Motor Shield
+↓
+四個 DC motor 控制四條線
+↓
+Tilt sensor 讀取平台姿態
+↓ BLE 回傳 X/Y/Z + Status
+Mac GUI 顯示姿態、3D 平台圖同 Log
+
+簡單嚟講，Mac 端負責人機互動，Arduino 端負責控制硬件，BLE 負責兩者之間嘅通訊，Xbox 手掣就用嚟做更直觀嘅手動控制。
+
+X.2 Arduino 程式功能
+
+Arduino 程式係底層控制核心，主要負責：
+
+接收 Mac / BLE 傳入嚟嘅文字指令
+控制四個 DC motor 收線或者放線
+讀取 MMA8452Q tilt sensor 嘅 X/Y/Z 數值
+判斷平台目前姿態，例如 Level、Front low、Left low
+支援 CALIBRATE 歸零
+支援 AUTO_ON / AUTO_OFF 自動穩定
+定時將姿態資料經 BLE 回傳俾 Mac
+Arduino 入面四個電機嘅 mapping 係：
+
+M1 = 左前 Left Front
+M2 = 右前 Right Front
+M3 = 後右 Rear Right
+M4 = 後左 Rear Left
+
+電機方向定義係：
+
+FORWARD = IN = 收線
+BACKWARD = OUT = 放線
+
+所以例如：
+
+LF_IN = 左前電機收線
+RF_OUT = 右前電機放線
+FRONT_IN = 前面兩個電機一齊收線
+LEFT_OUT = 左邊兩個電機一齊放線
+ALL_IN = 四個電機全部收線
+
+X.3 Mac Python 控制面板功能
+
+Mac Python 程式係上位機控制介面，主要功能包括：
+
+透過 Bleak 連接 HMSoft BLE 模組
+用 Tkinter 顯示控制面板
+發送 Arduino 文字指令
+接收 Arduino 回傳嘅 X/Y/Z 同 Status
+顯示平台目前姿態
+畫出簡化版 3D 平台傾斜示意圖
+提供手動電機控制按鈕
+提供 AUTO_ON、AUTO_OFF、CALIBRATE、STOP ALL
+支援 Xbox 手掣控制
+顯示 Log，方便 debug
+Mac 程式入面最重要嘅幾個部分係：
+
+Tkinter = GUI 控制面板
+Bleak = BLE 通訊
+pygame-ce = Xbox 手掣讀取
+asyncio + threading = 令 BLE 背景運行，唔阻塞 UI
+queue = 避免 BLE callback 直接碰 Tkinter 導致 crash
+
+X.4 必須安裝嘅 Python library
+
+Mac 端必須安裝：
+
+python3 -m pip install bleak
+
+如果要使用 Xbox 手掣，需要安裝：
+
+python3 -m pip install pygame-ce
+
+由於普通 pygame 喺 Python 3.14 上可能會 build wheel 失敗，所以目前用 pygame-ce 會比較穩定。
+
+檢查 Python 版本：
+
+python3 --version
+
+運行 Mac 控制程式：
+
+python3 filerout/engg1100v2.1.py
+
+X.5 Arduino 端需要嘅 library
+
+Arduino 程式需要：
+
+#include <AFMotor.h>
+#include <SoftwareSerial.h>
+#include <Wire.h>
+
+其中：
+
+AFMotor
+需要另外安裝，用嚟控制 L293D Motor Shield V1。
+SoftwareSerial
+Arduino 內置 library，用 A0/A1 模擬多一個 serial port 俾 BLE 用。
+Wire
+Arduino 內置 library，用 I2C 讀取 MMA8452Q tilt sensor。
+
+如果 Arduino IDE 顯示：
+
+AFMotor.h: No such file or directory
+
+就需要喺 Arduino IDE 入面安裝：
+
+Adafruit Motor Shield library V1
+
+安裝方法：
+
+Arduino IDE
+→ Library Manager
+→ 搜尋 Adafruit Motor Shield
+→ 安裝 V1 library
+
+X.6 BLE 地址同 UUID 查找方法
+
+Mac Python 程式需要兩個 BLE 資料：
+
+DEVICE_ADDRESS
+CHAR_UUID
+
+例如目前BLE module入面係：
+
+DEVICE_ADDRESS = "FB39458D-5F01-B0CE-AFA4-BC6A781B3407"
+CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
+
+X.6.1 掃描 BLE address
+
+可以建立一個 ble_scan.py：
+
+import asyncio
+from bleak import BleakScanner
+async def main():
+devices = await BleakScanner.discover(timeout=10)
+for d in devices:
+print(d.name, d.address)
+asyncio.run(main())
+
+運行：
+
+python3 ble_scan.py
+
+如果見到：
+
+HMSoft FB39458D-5F01-B0CE-AFA4-BC6A781B3407
+
+就將後面嗰串 address 放入：
+
+DEVICE_ADDRESS = "..."
+
+X.6.2 查找 characteristic UUID
+
+可以建立一個 find_uuid.py：
+
+import asyncio
+from bleak import BleakClient
+DEVICE_ADDRESS = "你的 BLE 地址"
+async def main():
+async with BleakClient(DEVICE_ADDRESS) as client:
+for service in client.services:
+print("Service:", service.uuid)
+for char in service.characteristics:
+print(" Characteristic:", char.uuid, char.properties)
+asyncio.run(main())
+
+運行：
+
+python3 find_uuid.py
+
+通常 HMSoft BLE module 會顯示：
+
+Service: 0000ffe0-0000-1000-8000-00805f9b34fb
+Characteristic: 0000ffe1-0000-1000-8000-00805f9b34fb
+
+將 characteristic UUID 放入：
+
+CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
+
+⸻
+
+X.7 基本使用方法
+
+Step 1：連接硬件
+
+基本硬件包括：
+
+Arduino UNO
+L293D Motor Shield V1
+HMSoft BLE module
+MMA8452Q tilt sensor
+4 個 DC motor
+
+主要接線：
+
+BLE TXD -> Arduino A0
+BLE RXD -> Arduino A1
+Tilt sensor SDA -> Arduino A4
+Tilt sensor SCL -> Arduino A5
+M1 = 左前
+M2 = 右前
+M3 = 後右
+M4 = 後左
+
+Step 2：上傳 Arduino 程式
+
+用 Arduino IDE 上傳 Arduino 程式。
+Serial Monitor 設定：
+
+9600 baud
+
+正常啟動後會見到：
+
+ENGG1100 system ready
+Tilt sensor ready
+Commands:
+...
+
+Step 3：運行 Mac GUI
+
+喺 Terminal 運行：
+
+python3 /Users/huangkaibin/Documents/engg1100v2.1.py
+
+Step 4：連接 BLE
+
+喺 Mac GUI 入面按：
+
+Connect BLE
+
+成功後會顯示：
+
+Connected to HMSoft
+Sending: STATUS
+Arduino: X: ... Y: ... Z: ... Status: ...
+
+如果顯示 connected 但冇資料，可以按：
+
+Request STATUS
+
+Step 5：校準 tilt sensor
+
+將平台放到你認為水平嘅狀態，然後按：
+
+CALIBRATE 归零
+
+Arduino 會記錄目前 X/Y/Z 作為 offset。
+之後呢個姿態會被當成：
+
+Level
+
+X.8 Xbox 手掣使用方法
+
+Xbox 手掣需要先喺 Mac Bluetooth 設定入面連接。
+之後喺 GUI 入面按：
+
+Connect Xbox
+
+目前 Xbox 控制邏輯係：
+
+左搖桿 = 四個角位單電機控制
+D-pad / 十字鍵 = 前後左右雙電機控制
+button 13 = 動作反轉，IN 變 OUT
+button 0 / A = 快速全收線
+Y = AUTO_ON
+B = AUTO_OFF
+X = CALIBRATE
+
+左搖桿
+
+推左前 = LF_IN
+推右前 = RF_IN
+推右後 = RR_IN
+推左後 = RL_IN
+
+按住 button 13 時：
+
+推左前 = LF_OUT
+推右前 = RF_OUT
+推右後 = RR_OUT
+推左後 = RL_OUT
+
+D-pad / 十字鍵
+
+前 = FRONT_IN
+後 = BACK_IN
+左 = LEFT_IN
+右 = RIGHT_IN
+
+按住 button 13 時：
+
+前 = FRONT_OUT
+後 = BACK_OUT
+左 = LEFT_OUT
+右 = RIGHT_OUT
+
+button 0 / A
+
+快速全收線
+
+呢個功能會暫時使用：
+
+HIGH + TIME_500 + ALL_IN
+
+完成後會自動還原：
+
+TIME_150
+
+咁樣唔會影響普通 Xbox 控制。
+
+X.9 點解系統要咁設計
+
+呢個控制系統係根據實際測試一步一步改出嚟。
+
+BLE crash 問題
+
+早期 BLE 收到 Arduino 回傳後，直接更新 Tkinter UI。
+但 BLE callback 係背景 thread，而 Tkinter 只可以喺主 thread 更新 UI。
+所以會出現 Python fatal crash。
+
+最後改成：
+
+BLE callback 只放資料入 queue
+Tkinter 主 thread 用 process_thread_queues() 更新 UI
+
+Xbox 操作唔直觀問題
+
+最初想用左搖桿同時控制：
+
+前後左右
+四個角
+
+但實測之後唔好操作。
+所以最後改成：
+
+左搖桿 = 四個角
+D-pad = 前後左右
+
+咁樣 demo 時會直觀好多。
+
+D-pad 無反應問題
+
+macOS / pygame 入面，Xbox D-pad 唔一定係 hat，可能係普通 button。
+最後用 live button scanner 測到：
+
+前 = button 10
+後 = button 7
+左 = button 8
+右 = button 9
+
+再根據實物方向反轉 mapping。
+
+button 13 邏輯
+
+button 13 原本被理解成方向反轉。
+但實際更好用嘅邏輯係：
+
+方向不變
+動作反轉
+
+即係：
+
+正常 = IN
+按住 13 = OUT
+
+咁樣操作員只需要記住：
+
+按住 13 就係放線
+
+X.10 常見問題排查
+
+BLE 連唔到
+
+檢查：
+
+Arduino 有冇供電
+BLE 模組燈有冇閃
+DEVICE_ADDRESS 係咪正確
+CHAR_UUID 係咪 ffe1
+有冇其他 App 佔用 BLE
+Connected 但冇資料
+
+檢查：
+
+按 Request STATUS
+Arduino 有冇 BT.println()
+Mac 程式有冇 process_thread_queues()
+CHAR_UUID 係咪正確
+Xbox 冇反應
+
+檢查：
+
+Xbox 手掣有冇連接 Mac Bluetooth
+有冇安裝 pygame-ce
+GUI 有冇按 Connect Xbox
+Xbox 區域有冇顯示 Buttons=[...]
+電機只係嘟嘟響但唔郁
+
+可能原因：
+
+speedValue 太低
+runTime 太短
+電機供電不足
+L293D Motor Shield 電流唔夠
+線軸或者機構阻力太大
+解決方法：
+
+切 HIGH
+增加 TIME
+檢查外部供電
+減少機械阻力
+X.11 總結
+
+呢個系統係一個由 Arduino、Mac BLE GUI、Xbox 手掣同 tilt sensor 組成嘅原型控制系統。
+
+Arduino 負責底層硬件控制，Mac 負責圖形界面同 BLE 通訊，Xbox 負責快速手動控制，tilt sensor 負責姿態回饋。
+透過呢個系統，原型可以做到：
+
+手動收放線
+前後左右雙電機控制
+四角單電機控制
+快速全收線
+姿態顯示
+3D 平台示意
+CALIBRATE 歸零
+AUTO_ON / AUTO_OFF 自穩
