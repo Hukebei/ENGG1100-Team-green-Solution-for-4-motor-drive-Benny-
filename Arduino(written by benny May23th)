@@ -1,0 +1,1039 @@
+// =====================================================
+// 【繁體粵語總說明】
+// 呢份 Arduino 程式係 ENGG1100 原型嘅控制端。
+// 佢負責接收 Mac / BLE 傳入嚟嘅文字指令，然後控制四個 DC motor。
+// 同時，佢會讀取 MMA8452Q 三軸 tilt sensor，判斷平台而家邊一邊低。
+//
+// 系統主要功能：
+// 1. 經 USB Serial 接收指令，方便用 Arduino Serial Monitor 測試。
+// 2. 經 BLE SoftwareSerial 接收指令，方便 Mac GUI / Xbox 控制。
+// 3. 控制四個電機：LF / RF / RR / RL。
+// 4. 支援單電機、雙電機、四電機同時收線 / 放線。
+// 5. 支援 LOW / MID / HIGH 速度切換。
+// 6. 支援 TIME_xxx 改手動動作時間。
+// 7. 支援 AUTOTIME_xxx 改自穩每次修正 pulse 時間。
+// 8. 支援 CALIBRATE，將當前 tilt sensor 姿態當成水平基準。
+// 9. 支援 AUTO_ON / AUTO_OFF 自動穩定功能。
+//
+// 注意：
+// - FORWARD 代表「收線 / IN」。
+// - BACKWARD 代表「放線 / OUT」。
+// - Arduino 會用 readStringUntil('\n') 讀指令，所以 Mac / BLE 發指令時一定要加換行。
+// =====================================================
+
+
+// =====================================================
+// 呢三行係要用嘅庫，唔好刪
+// AFMotor：控制 L293D Motor Shield V1
+// SoftwareSerial：用 A0/A1 扮多一個串口俾 BLE 藍牙用
+// Wire：I2C 通信，tilt sensor 靠佢讀數
+// =====================================================
+#include <AFMotor.h>
+#include <SoftwareSerial.h>
+#include <Wire.h>
+
+
+// =====================================================
+// BLE 藍牙設定
+// BLE TXD -> Arduino A0
+// BLE RXD -> Arduino A1
+//
+// 【調整原因】
+// Arduino UNO 只有一組硬件 Serial，通常已經用咗嚟同電腦 USB 溝通。
+// 所以 BLE 模組唔可以直接霸佔 Serial 0/1，否則 upload code 同 debug 會好麻煩。
+// 呢度用 SoftwareSerial，令 A0/A1 變成一組額外串口，專門同 HMSoft BLE 模組溝通。
+// =====================================================
+SoftwareSerial BT(A0, A1);
+
+
+// =====================================================
+// Tilt Sensor 設定
+// Keyestudio Tri-Axis Digital Tilt Sensor
+// MMA8452Q I2C address = 0x1D
+// SDA -> A4
+// SCL -> A5
+//
+// 【調整原因】
+// 呢個 sensor 係用 I2C，所以只需要 SDA / SCL 兩條資料線。
+// Arduino UNO 上面 A4 = SDA，A5 = SCL。
+// 0x1D 係 MMA8452Q 常見 I2C 地址，如果讀唔到 WHO_AM_I，第一步就要檢查地址同接線。
+// =====================================================
+#define MMA8452Q_ADDR 0x1D
+
+
+// =====================================================
+// Tilt sensor 原始讀數
+//
+// xValue / yValue / zValue 係 sensor 直接讀出嚟嘅原始姿態數值。
+// 呢啲數值未扣 offset，亦未經濾波。
+// =====================================================
+int xValue = 0;
+int yValue = 0;
+int zValue = 0;
+
+
+// =====================================================
+// Tilt sensor 歸零 offset
+// 按 CALIBRATE 之後，當前姿態會被當成 Level
+//
+// 【調整原因】
+// 實際安裝 sensor 時，好難保證 sensor 完全水平。
+// 如果唔做歸零，平台明明放平，程式可能仍然判斷成 Front low / Left low。
+// 所以 CALIBRATE 會記低當前 X/Y/Z，之後所有讀數都會扣走呢個 offset。
+// =====================================================
+int xOffset = 0;
+int yOffset = 0;
+int zOffset = 0;
+
+
+// =====================================================
+// 濾波後嘅姿態值
+// xFiltered / yFiltered 會比原始 xValue / yValue 穩定
+//
+// 【調整原因】
+// Tilt sensor 讀數會有少少跳動，如果直接用原始數值做自穩，電機會好容易抖。
+// 所以用簡單低通濾波，令數值變得平滑啲。
+// =====================================================
+float xFiltered = 0;
+float yFiltered = 0;
+
+
+// =====================================================
+// 傾斜判斷門檻
+//
+// 【調整原因】
+// tiltThreshold 太細：平台少少震動都會被判斷成傾斜，電機會亂郁。
+// tiltThreshold 太大：平台已經明顯傾斜，但程式仍然覺得 Level。
+// 目前 55 係根據實測手感調出嚟嘅折中值。
+// =====================================================
+int tiltThreshold = 55;
+
+
+// =====================================================
+// 自穩優化參數
+// =====================================================
+int levelDeadband = 60;
+// levelDeadband 係接近水平嘅死區。
+// 當 x/y 都喺呢個範圍內，就直接當 Level，避免臨界值附近反覆跳。
+
+float filterAlpha = 0.7;
+// filterAlpha 越大，濾波越穩，但反應越慢。
+// filterAlpha 越細，反應越快，但數值會跳得多啲。
+
+int minAutoRunTime = 30;
+int maxAutoRunTime = 120;
+// 自穩 pulse 最短同最長時間。
+// 傾斜細就郁短啲，傾斜大就郁長啲。
+
+unsigned long lastManualTime = 0;
+int manualLockoutTime = 300;
+// 手動控制之後，自穩會暫停一小段時間。
+// 【調整原因】
+// 如果人手撳完電機，自穩即刻介入，會好似同人搶控制。
+// 所以加 manualLockoutTime，令手動操作有優先權。
+
+
+// =====================================================
+// 電機設定
+// M1 = 左前
+// M2 = 右前
+// M3 = 後右
+// M4 = 後左
+//
+// 【調整原因】
+// 呢個 mapping 一定要同實際接線一致。
+// 如果 M1/M2/M3/M4 接反，Mac UI 或 Xbox 控制方向就會全部亂。
+// =====================================================
+AF_DCMotor M1(1);
+AF_DCMotor M2(2);
+AF_DCMotor M3(3);
+AF_DCMotor M4(4);
+
+
+// =====================================================
+// 電機速度同手動運行時間
+// =====================================================
+int speedValue = 80;
+// speedValue 係 AFMotor setSpeed() 用嘅 PWM 值，範圍大概 0-255。
+// 數值越大，電機越有力、越快。
+
+int runTime = 80;
+// runTime 係手動指令每次電機運行幾多 ms。
+// 例如 LF_IN 會令左前電機行 runTime 毫秒再停。
+
+
+// =====================================================
+// 姿態資料自動輸出設定
+// =====================================================
+unsigned long lastTiltPrintTime = 0;
+int tiltPrintInterval = 500;
+// 每 500 ms 輸出一次 tilt status 俾 Serial / BLE。
+// 【調整原因】
+// 太慢：Mac UI 更新唔即時。
+// 太快：BLE / Log 會刷太多資料，Mac UI 可能會卡。
+
+
+// =====================================================
+// 自穩設定
+// =====================================================
+bool autoStabilize = false;
+// 預設關閉自穩，避免一開機電機自己郁。
+
+unsigned long lastAutoTime = 0;
+int autoInterval = 300;
+// 自穩每隔幾多 ms 判斷一次。
+
+int autoRunTime = 30;
+// 自穩每次基本 pulse 時間。
+// 實際會再由 calculateAutoPulseTime() 根據傾斜程度動態計算。
+
+
+// =====================================================
+// setup()
+// Arduino 開機後只會行一次
+// =====================================================
+void setup() {
+  Serial.begin(9600);
+  BT.begin(9600);
+  Wire.begin();
+
+  setupTiltSensor();
+
+  setSpeedForAll();
+  stopAllMotors();
+
+  Serial.println("ENGG1100 system ready");
+  Serial.println("Commands:");
+  Serial.println("LF_IN / LF_OUT");
+  Serial.println("RF_IN / RF_OUT");
+  Serial.println("FRONT_IN / FRONT_OUT");
+  Serial.println("RR_IN / RR_OUT");
+  Serial.println("RL_IN / RL_OUT");
+  Serial.println("BACK_IN / BACK_OUT");
+  Serial.println("LEFT_IN / LEFT_OUT");
+  Serial.println("RIGHT_IN / RIGHT_OUT");
+  Serial.println("ALL_IN / ALL_OUT");
+  Serial.println("AUTO_ON / AUTO_OFF");
+  Serial.println("LOW / MID / HIGH");
+  Serial.println("TIME_250 / TIME_500 / TIME_1000 / TIME_2000");
+  Serial.println("AUTOTIME_50 / AUTOTIME_100 / AUTOTIME_150 / AUTOTIME_250 / AUTOTIME_500");
+  Serial.println("CALIBRATE");
+  Serial.println("ALLS");
+  Serial.println("STATUS");
+}
+
+
+// =====================================================
+// loop()
+// Arduino 開機後會一直重複行
+// =====================================================
+void loop() {
+  // USB Serial command
+  // 用 Arduino Serial Monitor 或 USB 線 debug 時會入呢度。
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    runCommand(command);
+  }
+
+  // BLE command
+  // Mac GUI / Xbox 控制會經 BLE 傳文字指令入嚟。
+  if (BT.available()) {
+    String command = BT.readStringUntil('\n');
+    command.trim();
+    runCommand(command);
+  }
+
+  // 自動定時輸出傾斜狀態
+  if (millis() - lastTiltPrintTime > tiltPrintInterval) {
+    lastTiltPrintTime = millis();
+    readTiltSensor();
+    printTiltStatus();
+  }
+
+  // 自動穩定
+  if (autoStabilize && millis() - lastAutoTime > autoInterval) {
+    lastAutoTime = millis();
+    autoStabilizeAction();
+  }
+}
+
+
+// =====================================================
+// 判斷呢條指令係咪手動電機控制
+// 手動控制之後，自穩會暫停一小段時間，避免搶控制
+// =====================================================
+bool isManualMotorCommand(String command) {
+  return command == "LF_IN" || command == "LF_OUT" ||
+         command == "RF_IN" || command == "RF_OUT" ||
+         command == "FRONT_IN" || command == "FRONT_OUT" ||
+         command == "RR_IN" || command == "RR_OUT" ||
+         command == "RL_IN" || command == "RL_OUT" ||
+         command == "BACK_IN" || command == "BACK_OUT" ||
+         command == "LEFT_IN" || command == "LEFT_OUT" ||
+         command == "RIGHT_IN" || command == "RIGHT_OUT" ||
+         command == "ALL_IN" || command == "ALL_OUT";
+}
+
+
+// =====================================================
+// runCommand()
+// 所有 USB / BLE 指令都會入嚟呢度
+//
+// 【調整原因】
+// Mac GUI 同 Serial Monitor 都用同一套文字指令。
+// 咁樣好處係：
+// - 可以直接喺 Serial Monitor 打 LF_IN 測試。
+// - Mac GUI / Xbox 只需要發同一啲文字。
+// - Arduino 端邏輯集中，唔會分散到好多地方。
+// =====================================================
+void runCommand(String command) {
+  command.toUpperCase();
+
+  if (isManualMotorCommand(command)) {
+    lastManualTime = millis();
+  }
+
+  // 左前
+  if (command == "LF_IN") {
+    runOneMotorForTime(M1, FORWARD, "Left Front IN", runTime);
+  }
+  else if (command == "LF_OUT") {
+    runOneMotorForTime(M1, BACKWARD, "Left Front OUT", runTime);
+  }
+
+  // 右前
+  else if (command == "RF_IN") {
+    runOneMotorForTime(M2, FORWARD, "Right Front IN", runTime);
+  }
+  else if (command == "RF_OUT") {
+    runOneMotorForTime(M2, BACKWARD, "Right Front OUT", runTime);
+  }
+
+  // 前部
+  else if (command == "FRONT_IN") {
+    runTwoMotorsForTime(M1, M2, FORWARD, FORWARD, "Front IN", runTime);
+  }
+  else if (command == "FRONT_OUT") {
+    runTwoMotorsForTime(M1, M2, BACKWARD, BACKWARD, "Front OUT", runTime);
+  }
+
+  // 後右
+  else if (command == "RR_IN") {
+    runOneMotorForTime(M3, FORWARD, "Rear Right IN", runTime);
+  }
+  else if (command == "RR_OUT") {
+    runOneMotorForTime(M3, BACKWARD, "Rear Right OUT", runTime);
+  }
+
+  // 後左
+  else if (command == "RL_IN") {
+    runOneMotorForTime(M4, FORWARD, "Rear Left IN", runTime);
+  }
+  else if (command == "RL_OUT") {
+    runOneMotorForTime(M4, BACKWARD, "Rear Left OUT", runTime);
+  }
+
+  // 後部
+  else if (command == "BACK_IN") {
+    runTwoMotorsForTime(M3, M4, FORWARD, FORWARD, "Back IN", runTime);
+  }
+  else if (command == "BACK_OUT") {
+    runTwoMotorsForTime(M3, M4, BACKWARD, BACKWARD, "Back OUT", runTime);
+  }
+
+  // 左邊
+  // M1 = 左前
+  // M4 = 後左
+  else if (command == "LEFT_IN") {
+    runTwoMotorsForTime(M1, M4, FORWARD, FORWARD, "Left IN", runTime);
+  }
+  else if (command == "LEFT_OUT") {
+    runTwoMotorsForTime(M1, M4, BACKWARD, BACKWARD, "Left OUT", runTime);
+  }
+
+  // 右邊
+  // M2 = 右前
+  // M3 = 後右
+  else if (command == "RIGHT_IN") {
+    runTwoMotorsForTime(M2, M3, FORWARD, FORWARD, "Right IN", runTime);
+  }
+  else if (command == "RIGHT_OUT") {
+    runTwoMotorsForTime(M2, M3, BACKWARD, BACKWARD, "Right OUT", runTime);
+  }
+
+  // 全收 / 全放
+  else if (command == "ALL_IN") {
+    runAllMotorsForTime(FORWARD, "All IN", runTime);
+  }
+  else if (command == "ALL_OUT") {
+    runAllMotorsForTime(BACKWARD, "All OUT", runTime);
+  }
+
+  // 自穩開關
+  else if (command == "AUTO_ON") {
+    autoStabilize = true;
+    Serial.println("Auto stabilize ON");
+    BT.println("Auto stabilize ON");
+  }
+  else if (command == "AUTO_OFF") {
+    autoStabilize = false;
+    stopAllMotors();
+    Serial.println("Auto stabilize OFF");
+    BT.println("Auto stabilize OFF");
+  }
+
+  // 全停
+  else if (command == "ALLS") {
+    autoStabilize = false;
+    stopAllMotors();
+    Serial.println("All motors stop");
+    BT.println("All motors stop");
+  }
+
+  // 速度控制
+  else if (command == "LOW") {
+    speedValue = 50;
+    setSpeedForAll();
+    Serial.println("Speed LOW");
+    BT.println("Speed LOW");
+  }
+  else if (command == "MID") {
+    speedValue = 90;
+    setSpeedForAll();
+    Serial.println("Speed MID");
+    BT.println("Speed MID");
+  }
+  else if (command == "HIGH") {
+    speedValue = 120;
+    setSpeedForAll();
+    Serial.println("Speed HIGH");
+    BT.println("Speed HIGH");
+  }
+
+  // 手動動作時間控制
+  else if (command.startsWith("TIME_")) {
+    int newTime = command.substring(5).toInt();
+
+    if (newTime >= 50 && newTime <= 5000) {
+      runTime = newTime;
+
+      Serial.print("Manual run time set to ");
+      Serial.println(runTime);
+
+      BT.print("Manual run time set to ");
+      BT.println(runTime);
+    }
+    else {
+      Serial.println("Invalid TIME value");
+      BT.println("Invalid TIME value");
+    }
+  }
+
+  // 自穩動作時間控制
+  else if (command.startsWith("AUTOTIME_")) {
+    int newTime = command.substring(9).toInt();
+
+    if (newTime >= 20 && newTime <= 2000) {
+      autoRunTime = newTime;
+
+      Serial.print("Auto run time set to ");
+      Serial.println(autoRunTime);
+
+      BT.print("Auto run time set to ");
+      BT.println(autoRunTime);
+    }
+    else {
+      Serial.println("Invalid AUTOTIME value");
+      BT.println("Invalid AUTOTIME value");
+    }
+  }
+
+  // CALIBRATE = 歸零 tilt sensor
+  else if (command == "CALIBRATE") {
+    calibrateTiltSensor();
+  }
+
+  // 手動讀取姿態
+  else if (command == "STATUS") {
+    readTiltSensor();
+    printTiltStatus();
+  }
+
+  else {
+    Serial.print("Unknown command: ");
+    Serial.println(command);
+    BT.print("Unknown command: ");
+    BT.println(command);
+  }
+}
+
+
+// =====================================================
+// 電機動作包裝函數
+//
+// 【調整原因】
+// 所有電機動作都統一經過呢幾個 wrapper。
+// 咁樣 Serial / BLE 都會回傳同一套 message，方便 Mac Log 顯示。
+// =====================================================
+void runOneMotorForTime(AF_DCMotor &motor, uint8_t direction, String message, int duration) {
+  Serial.println(message);
+  BT.println(message);
+
+  smoothOneMotor(motor, direction, duration);
+
+  Serial.println("Motor stop");
+  BT.println("Motor stop");
+}
+
+void runTwoMotorsForTime(AF_DCMotor &motorA, AF_DCMotor &motorB, uint8_t directionA, uint8_t directionB, String message, int duration) {
+  Serial.println(message);
+  BT.println(message);
+
+  smoothTwoMotors(motorA, motorB, directionA, directionB, duration);
+
+  Serial.println("Motors stop");
+  BT.println("Motors stop");
+}
+
+void runAllMotorsForTime(uint8_t direction, String message, int duration) {
+  Serial.println(message);
+  BT.println(message);
+
+  smoothFourMotors(direction, direction, direction, direction, duration);
+
+  Serial.println("All motors stop");
+  BT.println("All motors stop");
+}
+
+
+// =====================================================
+// 平順單電機控制
+//
+// 【調整原因】
+// 一開始如果電機直接由 0 跳到 targetSpeed，會有明顯「duang duang」衝擊感。
+// 所以加入 ramp up / ramp down：
+// - 開始時逐步加速
+// - 結束前逐步減速
+// 咁樣電機動作會平順啲，機構震動亦會細啲。
+// =====================================================
+void smoothOneMotor(AF_DCMotor &motor, uint8_t direction, int duration) {
+  int startSpeed = 60;
+  int targetSpeed = speedValue;
+
+  if (targetSpeed < startSpeed) {
+    startSpeed = targetSpeed;
+  }
+
+  int rampSteps = 3;
+  int stepDelay = duration / 8;
+
+  if (stepDelay < 5) {
+    stepDelay = 5;
+  }
+  if (stepDelay > 20) {
+    stepDelay = 20;
+  }
+
+  for (int i = 1; i <= rampSteps; i++) {
+    int s = startSpeed + (targetSpeed - startSpeed) * i / rampSteps;
+    motor.setSpeed(s);
+    motor.run(direction);
+    delay(stepDelay);
+  }
+
+  int usedRampTime = rampSteps * stepDelay * 2;
+  int holdTime = duration - usedRampTime;
+
+  if (holdTime > 0) {
+    delay(holdTime);
+  }
+
+  for (int i = rampSteps; i >= 1; i--) {
+    int s = startSpeed + (targetSpeed - startSpeed) * i / rampSteps;
+    motor.setSpeed(s);
+    motor.run(direction);
+    delay(stepDelay);
+  }
+
+  motor.run(RELEASE);
+  motor.setSpeed(speedValue);
+}
+
+
+// =====================================================
+// 平順雙電機控制
+//
+// 【調整原因】
+// 雙電機同時郁時，如果一邊先起、一邊後起，平台會有偏扭。
+// 所以兩個 motor 喺同一個 ramp loop 入面同步 setSpeed / run。
+// =====================================================
+void smoothTwoMotors(AF_DCMotor &motorA, AF_DCMotor &motorB, uint8_t directionA, uint8_t directionB, int duration) {
+  int startSpeed = 90;
+  int targetSpeed = speedValue;
+
+  if (targetSpeed < startSpeed) {
+    startSpeed = targetSpeed;
+  }
+
+  int rampSteps = 3;
+  int stepDelay = duration / 8;
+
+  if (stepDelay < 5) {
+    stepDelay = 5;
+  }
+  if (stepDelay > 20) {
+    stepDelay = 20;
+  }
+
+  for (int i = 1; i <= rampSteps; i++) {
+    int s = startSpeed + (targetSpeed - startSpeed) * i / rampSteps;
+
+    motorA.setSpeed(s);
+    motorB.setSpeed(s);
+
+    motorA.run(directionA);
+    motorB.run(directionB);
+
+    delay(stepDelay);
+  }
+
+  int usedRampTime = rampSteps * stepDelay * 2;
+  int holdTime = duration - usedRampTime;
+
+  if (holdTime > 0) {
+    delay(holdTime);
+  }
+
+  for (int i = rampSteps; i >= 1; i--) {
+    int s = startSpeed + (targetSpeed - startSpeed) * i / rampSteps;
+
+    motorA.setSpeed(s);
+    motorB.setSpeed(s);
+
+    motorA.run(directionA);
+    motorB.run(directionB);
+
+    delay(stepDelay);
+  }
+
+  motorA.run(RELEASE);
+  motorB.run(RELEASE);
+
+  motorA.setSpeed(speedValue);
+  motorB.setSpeed(speedValue);
+}
+
+
+// =====================================================
+// 平順四電機控制
+//
+// 【調整原因】
+// ALL_IN / ALL_OUT 或自穩某啲方向需要四個電機同時郁。
+// 呢度同雙電機一樣，用同一個 ramp loop 令四個電機同步加速 / 減速。
+// =====================================================
+void smoothFourMotors(uint8_t d1, uint8_t d2, uint8_t d3, uint8_t d4, int duration) {
+  int startSpeed = 100;
+  int targetSpeed = speedValue;
+
+  if (targetSpeed < startSpeed) {
+    startSpeed = targetSpeed;
+  }
+
+  int rampSteps = 3;
+  int stepDelay = duration / 8;
+
+  if (stepDelay < 5) {
+    stepDelay = 5;
+  }
+  if (stepDelay > 20) {
+    stepDelay = 20;
+  }
+
+  for (int i = 1; i <= rampSteps; i++) {
+    int s = startSpeed + (targetSpeed - startSpeed) * i / rampSteps;
+
+    M1.setSpeed(s);
+    M2.setSpeed(s);
+    M3.setSpeed(s);
+    M4.setSpeed(s);
+
+    M1.run(d1);
+    M2.run(d2);
+    M3.run(d3);
+    M4.run(d4);
+
+    delay(stepDelay);
+  }
+
+  int usedRampTime = rampSteps * stepDelay * 2;
+  int holdTime = duration - usedRampTime;
+
+  if (holdTime > 0) {
+    delay(holdTime);
+  }
+
+  for (int i = rampSteps; i >= 1; i--) {
+    int s = startSpeed + (targetSpeed - startSpeed) * i / rampSteps;
+
+    M1.setSpeed(s);
+    M2.setSpeed(s);
+    M3.setSpeed(s);
+    M4.setSpeed(s);
+
+    M1.run(d1);
+    M2.run(d2);
+    M3.run(d3);
+    M4.run(d4);
+
+    delay(stepDelay);
+  }
+
+  stopAllMotors();
+  setSpeedForAll();
+}
+
+
+// =====================================================
+// 基本電機組合
+// =====================================================
+void runFrontForTime(uint8_t direction, int duration) {
+  smoothTwoMotors(M1, M2, direction, direction, duration);
+}
+
+void runBackForTime(uint8_t direction, int duration) {
+  smoothTwoMotors(M3, M4, direction, direction, duration);
+}
+
+void runLeftForTime(uint8_t direction, int duration) {
+  smoothTwoMotors(M1, M4, direction, direction, duration);
+}
+
+void runRightForTime(uint8_t direction, int duration) {
+  smoothTwoMotors(M2, M3, direction, direction, duration);
+}
+
+void setSpeedForAll() {
+  M1.setSpeed(speedValue);
+  M2.setSpeed(speedValue);
+  M3.setSpeed(speedValue);
+  M4.setSpeed(speedValue);
+}
+
+void stopAllMotors() {
+  M1.run(RELEASE);
+  M2.run(RELEASE);
+  M3.run(RELEASE);
+  M4.run(RELEASE);
+}
+
+
+// =====================================================
+// 根據傾斜程度計算自穩動作時間
+// 傾斜細：動作短
+// 傾斜大：動作長
+//
+// 【調整原因】
+// 固定 autoRunTime 會有兩個問題：
+// - 細傾斜時郁太多，容易過度修正。
+// - 大傾斜時郁太少，修正太慢。
+// 所以根據 error 大細 map 到 minAutoRunTime ~ maxAutoRunTime。
+// =====================================================
+int calculateAutoPulseTime() {
+  int errorX = abs((int)xFiltered);
+  int errorY = abs((int)yFiltered);
+  int error = max(errorX, errorY);
+
+  int pulse = map(error, tiltThreshold, 400, minAutoRunTime, maxAutoRunTime);
+
+  if (pulse < minAutoRunTime) {
+    pulse = minAutoRunTime;
+  }
+
+  if (pulse > maxAutoRunTime) {
+    pulse = maxAutoRunTime;
+  }
+
+  return pulse;
+}
+
+
+// =====================================================
+// 自動穩定函數：優化版
+// 低邊放線，對角或者相反邊收線
+//
+// 【調整原因】
+// 自穩唔係連續長時間開 motor，而係一下一下 pulse 修正。
+// 咁樣可以避免一次修正太多。
+// 另外，手動控制後會 lockout 300ms，避免自穩同人手控制打架。
+// =====================================================
+void autoStabilizeAction() {
+  if (millis() - lastManualTime < manualLockoutTime) {
+    return;
+  }
+
+  readTiltSensor();
+  updateFilteredTilt();
+
+  String status = getTiltStatus();
+
+  if (status == "Level") {
+    stopAllMotors();
+    return;
+  }
+
+  int pulseTime = calculateAutoPulseTime();
+
+  Serial.print("Auto stabilize: ");
+  Serial.print(status);
+  Serial.print("  Pulse: ");
+  Serial.println(pulseTime);
+
+  BT.print("Auto stabilize: ");
+  BT.print(status);
+  BT.print("  Pulse: ");
+  BT.println(pulseTime);
+
+  // FORWARD = 收
+  // BACKWARD = 放
+
+  if (status == "Front-Left low") {
+    smoothTwoMotors(M1, M3, BACKWARD, FORWARD, pulseTime);
+  }
+
+  else if (status == "Front-Right low") {
+    smoothTwoMotors(M2, M4, BACKWARD, FORWARD, pulseTime);
+  }
+
+  else if (status == "Back-Right low") {
+    smoothTwoMotors(M3, M1, BACKWARD, FORWARD, pulseTime);
+  }
+
+  else if (status == "Back-Left low") {
+    smoothTwoMotors(M4, M2, BACKWARD, FORWARD, pulseTime);
+  }
+
+  else if (status == "Front low") {
+    smoothFourMotors(BACKWARD, BACKWARD, FORWARD, FORWARD, pulseTime);
+  }
+
+  else if (status == "Back low") {
+    smoothFourMotors(FORWARD, FORWARD, BACKWARD, BACKWARD, pulseTime);
+  }
+
+  else if (status == "Left low") {
+    smoothFourMotors(BACKWARD, FORWARD, FORWARD, BACKWARD, pulseTime);
+  }
+
+  else if (status == "Right low") {
+    smoothFourMotors(FORWARD, BACKWARD, BACKWARD, FORWARD, pulseTime);
+  }
+}
+
+
+// =====================================================
+// Tilt Sensor 初始化
+// =====================================================
+void setupTiltSensor() {
+  byte whoAmI = readRegister(0x0D);
+
+  Serial.print("Tilt sensor WHO_AM_I: 0x");
+  Serial.println(whoAmI, HEX);
+
+  writeRegister(0x2A, 0x00);
+  writeRegister(0x0E, 0x00);
+  writeRegister(0x2A, 0x01);
+
+  Serial.println("Tilt sensor ready");
+}
+
+
+// =====================================================
+// 寫入 sensor register
+// =====================================================
+void writeRegister(byte reg, byte value) {
+  Wire.beginTransmission(MMA8452Q_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+
+// =====================================================
+// 讀取 sensor register
+// =====================================================
+byte readRegister(byte reg) {
+  Wire.beginTransmission(MMA8452Q_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MMA8452Q_ADDR, 1);
+
+  if (Wire.available()) {
+    return Wire.read();
+  }
+
+  return 0;
+}
+
+
+// =====================================================
+// 讀取 X/Y/Z 原始值
+// =====================================================
+void readTiltSensor() {
+  Wire.beginTransmission(MMA8452Q_ADDR);
+  Wire.write(0x01);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MMA8452Q_ADDR, 6);
+
+  if (Wire.available() >= 6) {
+    byte xMSB = Wire.read();
+    byte xLSB = Wire.read();
+    byte yMSB = Wire.read();
+    byte yLSB = Wire.read();
+    byte zMSB = Wire.read();
+    byte zLSB = Wire.read();
+
+    xValue = ((int16_t)((xMSB << 8) | xLSB)) >> 4;
+    yValue = ((int16_t)((yMSB << 8) | yLSB)) >> 4;
+    zValue = ((int16_t)((zMSB << 8) | zLSB)) >> 4;
+  }
+}
+
+
+// =====================================================
+// 更新濾波後嘅 tilt 數值
+// =====================================================
+void updateFilteredTilt() {
+  int xCorrected = xValue - xOffset;
+  int yCorrected = yValue - yOffset;
+
+  xFiltered = filterAlpha * xFiltered + (1.0 - filterAlpha) * xCorrected;
+  yFiltered = filterAlpha * yFiltered + (1.0 - filterAlpha) * yCorrected;
+}
+
+
+// =====================================================
+// CALIBRATE 歸零函數
+// =====================================================
+void calibrateTiltSensor() {
+  long xSum = 0;
+  long ySum = 0;
+  long zSum = 0;
+
+  int samples = 20;
+
+  for (int i = 0; i < samples; i++) {
+    readTiltSensor();
+
+    xSum += xValue;
+    ySum += yValue;
+    zSum += zValue;
+
+    delay(20);
+  }
+
+  xOffset = xSum / samples;
+  yOffset = ySum / samples;
+  zOffset = zSum / samples;
+
+  xFiltered = 0;
+  yFiltered = 0;
+
+  Serial.print("Tilt calibrated. Offset X: ");
+  Serial.print(xOffset);
+  Serial.print("  Y: ");
+  Serial.print(yOffset);
+  Serial.print("  Z: ");
+  Serial.println(zOffset);
+
+  BT.print("Tilt calibrated. Offset X: ");
+  BT.print(xOffset);
+  BT.print("  Y: ");
+  BT.print(yOffset);
+  BT.print("  Z: ");
+  BT.println(zOffset);
+
+  readTiltSensor();
+  printTiltStatus();
+}
+
+
+// =====================================================
+// 輸出姿態狀態
+// 輸出嘅係濾波後數值
+// =====================================================
+void printTiltStatus() {
+  updateFilteredTilt();
+
+  int zCorrected = zValue - zOffset;
+
+  String status = getTiltStatus();
+
+  Serial.print("X: ");
+  Serial.print((int)xFiltered);
+  Serial.print("  Y: ");
+  Serial.print((int)yFiltered);
+  Serial.print("  Z: ");
+  Serial.print(zCorrected);
+  Serial.print("  Status: ");
+  Serial.println(status);
+
+  BT.print("X: ");
+  BT.print((int)xFiltered);
+  BT.print("  Y: ");
+  BT.print((int)yFiltered);
+  BT.print("  Z: ");
+  BT.print(zCorrected);
+  BT.print("  Status: ");
+  BT.println(status);
+}
+
+
+// =====================================================
+// 判斷平台邊度低
+// 用濾波後數值判斷
+// =====================================================
+String getTiltStatus() {
+  int xUse = (int)xFiltered;
+  int yUse = (int)yFiltered;
+
+  bool nearLevelX = abs(xUse) < levelDeadband;
+  bool nearLevelY = abs(yUse) < levelDeadband;
+
+  if (nearLevelX && nearLevelY) {
+    return "Level";
+  }
+
+  bool frontLow = xUse < -tiltThreshold;
+  bool backLow  = xUse >  tiltThreshold;
+  bool leftLow  = yUse < -tiltThreshold;
+  bool rightLow = yUse >  tiltThreshold;
+
+  if (frontLow && leftLow) {
+    return "Front-Left low";
+  }
+  else if (frontLow && rightLow) {
+    return "Front-Right low";
+  }
+  else if (backLow && leftLow) {
+    return "Back-Left low";
+  }
+  else if (backLow && rightLow) {
+    return "Back-Right low";
+  }
+  else if (frontLow) {
+    return "Front low";
+  }
+  else if (backLow) {
+    return "Back low";
+  }
+  else if (leftLow) {
+    return "Left low";
+  }
+  else if (rightLow) {
+    return "Right low";
+  }
+  else {
+    return "Level";
+  }
+}
